@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
-	"strconv"
 	"sync"
 	"time"
 
@@ -166,16 +165,19 @@ func resolveMetadata(ctx C.PlainContext, metadata *C.Metadata) (proxy C.Proxy, r
 		proxy = proxies["DIRECT"]
 	case Global:
 		proxy = proxies["GLOBAL"]
-	// Rule
-	default:
+	case Rule:
 		proxy, rule, err = match(metadata)
+	default:
+		panic(fmt.Sprintf("unknown mode: %s", mode))
 	}
+
 	return
 }
 
 func handleUDPConn(packet *inbound.PacketAdapter) {
 	metadata := packet.Metadata()
 	if !metadata.Valid() {
+		packet.Drop()
 		log.Warnln("[Metadata] not valid: %#v", metadata)
 		return
 	}
@@ -188,6 +190,7 @@ func handleUDPConn(packet *inbound.PacketAdapter) {
 	}
 
 	if err := preHandleMetadata(metadata); err != nil {
+		packet.Drop()
 		log.Debugln("[Metadata PreHandle] error: %s", err)
 		return
 	}
@@ -196,8 +199,10 @@ func handleUDPConn(packet *inbound.PacketAdapter) {
 	if !metadata.Resolved() {
 		ips, err := resolver.LookupIP(context.Background(), metadata.Host)
 		if err != nil {
+			packet.Drop()
 			return
 		} else if len(ips) == 0 {
+			packet.Drop()
 			return
 		}
 		metadata.DstIP = ips[0]
@@ -215,6 +220,7 @@ func handleUDPConn(packet *inbound.PacketAdapter) {
 	}
 
 	if handle() {
+		packet.Drop()
 		return
 	}
 
@@ -222,6 +228,8 @@ func handleUDPConn(packet *inbound.PacketAdapter) {
 	cond, loaded := natTable.GetOrCreateLock(lockKey)
 
 	go func() {
+		defer packet.Drop()
+
 		if loaded {
 			cond.L.Lock()
 			cond.Wait()
@@ -394,9 +402,10 @@ func match(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
 		if !processFound && rule.ShouldFindProcess() {
 			processFound = true
 
-			srcPort, err := strconv.ParseUint(metadata.SrcPort, 10, 16)
-			if err == nil {
-				path, err := P.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(srcPort))
+			srcIP, ok := netip.AddrFromSlice(metadata.SrcIP)
+			if ok && metadata.OriginDst.IsValid() {
+				srcIP = srcIP.Unmap()
+				path, err := P.FindProcessPath(metadata.NetWork.String(), netip.AddrPortFrom(srcIP, uint16(metadata.SrcPort)), metadata.OriginDst)
 				if err != nil {
 					log.Debugln("[Process] find process %s: %v", metadata.String(), err)
 				} else {
