@@ -6,21 +6,18 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"hash/fnv"
 	"io"
-	"math/rand"
+	mathRand "math/rand"
 	"net"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
 
 // Conn wrapper a net.Conn with vmess protocol
 type Conn struct {
@@ -35,6 +32,7 @@ type Conn struct {
 	respBodyKey []byte
 	respV       byte
 	security    byte
+	option      byte
 	isAead      bool
 
 	received bool
@@ -74,9 +72,9 @@ func (vc *Conn) sendRequest() error {
 	buf.Write(vc.reqBodyIV[:])
 	buf.Write(vc.reqBodyKey[:])
 	buf.WriteByte(vc.respV)
-	buf.WriteByte(OptionChunkStream)
+	buf.WriteByte(vc.option)
 
-	p := rand.Intn(16)
+	p := mathRand.Intn(16)
 	// P Sec Reserve Cmd
 	buf.WriteByte(byte(p<<4) | byte(vc.security))
 	buf.WriteByte(0)
@@ -206,6 +204,7 @@ func newConn(conn net.Conn, id *ID, dst *DstAddr, security Security, isAead bool
 	copy(reqBodyIV[:], randBytes[:16])
 	copy(reqBodyKey[:], randBytes[16:32])
 	respV := randBytes[32]
+	option := OptionChunkStream
 
 	var (
 		respBodyKey []byte
@@ -227,6 +226,16 @@ func newConn(conn net.Conn, id *ID, dst *DstAddr, security Security, isAead bool
 	var writer io.Writer
 	var reader io.Reader
 	switch security {
+	case SecurityZero:
+		security = SecurityNone
+		if !dst.UDP {
+			reader = conn
+			writer = conn
+			option = 0
+		} else {
+			reader = newChunkReader(conn)
+			writer = newChunkWriter(conn)
+		}
 	case SecurityNone:
 		reader = newChunkReader(conn)
 		writer = newChunkWriter(conn)
@@ -267,6 +276,7 @@ func newConn(conn net.Conn, id *ID, dst *DstAddr, security Security, isAead bool
 		reader:      reader,
 		writer:      writer,
 		security:    security,
+		option:      option,
 		isAead:      isAead,
 	}
 	if err := c.sendRequest(); err != nil {

@@ -129,13 +129,9 @@ func updateDNS(c *config.DNS) {
 			IPCIDR:    c.FallbackFilter.IPCIDR,
 			Domain:    c.FallbackFilter.Domain,
 		},
-		Default: c.DefaultNameserver,
-		Policy:  c.NameServerPolicy,
-	}
-
-	// deprecated warnning
-	if cfg.EnhancedMode == C.DNSMapping {
-		log.Warnln("[DNS] %s is deprecated, please use %s instead", cfg.EnhancedMode.String(), C.DNSFakeIP.String())
+		Default:       c.DefaultNameserver,
+		Policy:        c.NameServerPolicy,
+		SearchDomains: c.SearchDomains,
 	}
 
 	r := dns.NewResolver(cfg)
