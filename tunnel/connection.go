@@ -1,111 +1,35 @@
 package tunnel
 
 import (
-	"bufio"
 	"errors"
-	"io"
 	"net"
-	"net/http"
-	"strings"
+	"net/netip"
 	"time"
 
-	adapters "github.com/Dreamacro/clash/adapters/inbound"
-	"github.com/Dreamacro/clash/component/resolver"
-	C "github.com/Dreamacro/clash/constant"
-
+	N "github.com/Dreamacro/clash/common/net"
 	"github.com/Dreamacro/clash/common/pool"
+	C "github.com/Dreamacro/clash/constant"
 )
-
-func handleHTTP(request *adapters.HTTPAdapter, outbound net.Conn) {
-	req := request.R
-	host := req.Host
-
-	inboundReader := bufio.NewReader(request)
-	outboundReader := bufio.NewReader(outbound)
-
-	for {
-		keepAlive := strings.TrimSpace(strings.ToLower(req.Header.Get("Proxy-Connection"))) == "keep-alive"
-
-		req.Header.Set("Connection", "close")
-		req.RequestURI = ""
-		adapters.RemoveHopByHopHeaders(req.Header)
-		err := req.Write(outbound)
-		if err != nil {
-			break
-		}
-
-	handleResponse:
-		resp, err := http.ReadResponse(outboundReader, req)
-		if err != nil {
-			break
-		}
-		adapters.RemoveHopByHopHeaders(resp.Header)
-
-		if resp.StatusCode == http.StatusContinue {
-			err = resp.Write(request)
-			if err != nil {
-				break
-			}
-			goto handleResponse
-		}
-
-		if keepAlive || resp.ContentLength >= 0 {
-			resp.Header.Set("Proxy-Connection", "keep-alive")
-			resp.Header.Set("Connection", "keep-alive")
-			resp.Header.Set("Keep-Alive", "timeout=4")
-			resp.Close = false
-		} else {
-			resp.Close = true
-		}
-		err = resp.Write(request)
-		if err != nil || resp.Close {
-			break
-		}
-
-		// even if resp.Write write body to the connection, but some http request have to Copy to close it
-		buf := pool.Get(pool.RelayBufferSize)
-		_, err = io.CopyBuffer(request, resp.Body, buf)
-		pool.Put(buf)
-		if err != nil && err != io.EOF {
-			break
-		}
-
-		req, err = http.ReadRequest(inboundReader)
-		if err != nil {
-			break
-		}
-
-		// Sometimes firefox just open a socket to process multiple domains in HTTP
-		// The temporary solution is close connection when encountering different HOST
-		if req.Host != host {
-			break
-		}
-	}
-}
 
 func handleUDPToRemote(packet C.UDPPacket, pc C.PacketConn, metadata *C.Metadata) error {
 	defer packet.Drop()
-
-	// local resolve UDP dns
-	if !metadata.Resolved() {
-		ip, err := resolver.ResolveIP(metadata.Host)
-		if err != nil {
-			return err
-		}
-		metadata.DstIP = ip
-	}
 
 	addr := metadata.UDPAddr()
 	if addr == nil {
 		return errors.New("udp addr invalid")
 	}
 
-	_, err := pc.WriteTo(packet.Data(), addr)
-	return err
+	if _, err := pc.WriteTo(packet.Data(), addr); err != nil {
+		return err
+	}
+	// reset timeout
+	pc.SetReadDeadline(time.Now().Add(udpTimeout))
+
+	return nil
 }
 
-func handleUDPToLocal(packet C.UDPPacket, pc net.PacketConn, key string, fAddr net.Addr) {
-	buf := pool.Get(pool.RelayBufferSize)
+func handleUDPToLocal(packet C.UDPPacket, pc net.PacketConn, key string, oAddr, fAddr netip.Addr) {
+	buf := pool.Get(pool.UDPBufferSize)
 	defer pool.Put(buf)
 	defer natTable.Delete(key)
 	defer pc.Close()
@@ -117,36 +41,22 @@ func handleUDPToLocal(packet C.UDPPacket, pc net.PacketConn, key string, fAddr n
 			return
 		}
 
-		if fAddr != nil {
-			from = fAddr
+		fromUDPAddr := from.(*net.UDPAddr)
+		if fAddr.IsValid() {
+			fromAddr, _ := netip.AddrFromSlice(fromUDPAddr.IP)
+			fromAddr.Unmap()
+			if oAddr == fromAddr {
+				fromUDPAddr.IP = fAddr.AsSlice()
+			}
 		}
 
-		n, err = packet.WriteBack(buf[:n], from)
+		_, err = packet.WriteBack(buf[:n], fromUDPAddr)
 		if err != nil {
 			return
 		}
 	}
 }
 
-func handleSocket(request *adapters.SocketAdapter, outbound net.Conn) {
-	relay(request, outbound)
-}
-
-// relay copies between left and right bidirectionally.
-func relay(leftConn, rightConn net.Conn) {
-	ch := make(chan error)
-
-	go func() {
-		buf := pool.Get(pool.RelayBufferSize)
-		_, err := io.CopyBuffer(leftConn, rightConn, buf)
-		pool.Put(buf)
-		leftConn.SetReadDeadline(time.Now())
-		ch <- err
-	}()
-
-	buf := pool.Get(pool.RelayBufferSize)
-	io.CopyBuffer(rightConn, leftConn, buf)
-	pool.Put(buf)
-	rightConn.SetReadDeadline(time.Now())
-	<-ch
+func handleSocket(ctx C.ConnContext, outbound net.Conn) {
+	N.Relay(ctx.Conn(), outbound)
 }

@@ -8,11 +8,7 @@ import (
 	"sync"
 )
 
-var defaultAllocator *Allocator
-
-func init() {
-	defaultAllocator = NewAllocator()
-}
+var defaultAllocator = NewAllocator()
 
 // Allocator for incoming frames, optimized to prevent overwriting after zeroing
 type Allocator struct {
@@ -27,7 +23,7 @@ func NewAllocator() *Allocator {
 	alloc.buffers = make([]sync.Pool, 17) // 1B -> 64K
 	for k := range alloc.buffers {
 		i := k
-		alloc.buffers[k].New = func() interface{} {
+		alloc.buffers[k].New = func() any {
 			return make([]byte, 1<<uint32(i))
 		}
 	}
@@ -55,11 +51,14 @@ func (alloc *Allocator) Put(buf []byte) error {
 	if cap(buf) == 0 || cap(buf) > 65536 || cap(buf) != 1<<bits {
 		return errors.New("allocator Put() incorrect buffer size")
 	}
+
+	//nolint
+	//lint:ignore SA6002 ignore temporarily
 	alloc.buffers[bits].Put(buf)
 	return nil
 }
 
-// msb return the pos of most significiant bit
+// msb return the pos of most significant bit
 func msb(size int) uint16 {
 	return uint16(bits.Len32(uint32(size)) - 1)
 }

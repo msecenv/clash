@@ -7,12 +7,13 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Dreamacro/clash/adapters/outbound"
-	"github.com/Dreamacro/clash/adapters/outboundgroup"
+	"github.com/Dreamacro/clash/adapter"
+	"github.com/Dreamacro/clash/adapter/outboundgroup"
+	"github.com/Dreamacro/clash/component/profile/cachefile"
 	C "github.com/Dreamacro/clash/constant"
 	"github.com/Dreamacro/clash/tunnel"
 
-	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
 )
 
@@ -65,19 +66,17 @@ func getProxy(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, r, proxy)
 }
 
-type UpdateProxyRequest struct {
-	Name string `json:"name"`
-}
-
 func updateProxy(w http.ResponseWriter, r *http.Request) {
-	req := UpdateProxyRequest{}
+	req := struct {
+		Name string `json:"name"`
+	}{}
 	if err := render.DecodeJSON(r.Body, &req); err != nil {
 		render.Status(r, http.StatusBadRequest)
 		render.JSON(w, r, ErrBadRequest)
 		return
 	}
 
-	proxy := r.Context().Value(CtxKeyProxy).(*outbound.Proxy)
+	proxy := r.Context().Value(CtxKeyProxy).(*adapter.Proxy)
 	selector, ok := proxy.ProxyAdapter.(*outboundgroup.Selector)
 	if !ok {
 		render.Status(r, http.StatusBadRequest)
@@ -91,6 +90,7 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cachefile.Cache().SetSelected(proxy.Name(), req.Name)
 	render.NoContent(w, r)
 }
 

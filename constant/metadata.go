@@ -4,21 +4,22 @@ import (
 	"encoding/json"
 	"net"
 	"strconv"
+
+	"github.com/Dreamacro/clash/transport/socks5"
 )
 
 // Socks addr type
 const (
-	AtypIPv4       = 1
-	AtypDomainName = 3
-	AtypIPv6       = 4
-
 	TCP NetWork = iota
 	UDP
 
 	HTTP Type = iota
 	HTTPCONNECT
-	SOCKS
+	SOCKS4
+	SOCKS5
 	REDIR
+	TPROXY
+	TUNNEL
 )
 
 type NetWork int
@@ -42,10 +43,14 @@ func (t Type) String() string {
 		return "HTTP"
 	case HTTPCONNECT:
 		return "HTTP Connect"
-	case SOCKS:
+	case SOCKS4:
+		return "Socks4"
+	case SOCKS5:
 		return "Socks5"
 	case REDIR:
 		return "Redir"
+	case TPROXY:
+		return "TProxy"
 	default:
 		return "Unknown"
 	}
@@ -57,14 +62,16 @@ func (t Type) MarshalJSON() ([]byte, error) {
 
 // Metadata is used to store connection address
 type Metadata struct {
-	NetWork  NetWork `json:"network"`
-	Type     Type    `json:"type"`
-	SrcIP    net.IP  `json:"sourceIP"`
-	DstIP    net.IP  `json:"destinationIP"`
-	SrcPort  string  `json:"sourcePort"`
-	DstPort  string  `json:"destinationPort"`
-	AddrType int     `json:"-"`
-	Host     string  `json:"host"`
+	NetWork      NetWork `json:"network"`
+	Type         Type    `json:"type"`
+	SrcIP        net.IP  `json:"sourceIP"`
+	DstIP        net.IP  `json:"destinationIP"`
+	SrcPort      string  `json:"sourcePort"`
+	DstPort      string  `json:"destinationPort"`
+	Host         string  `json:"host"`
+	DNSMode      DNSMode `json:"dnsMode"`
+	ProcessPath  string  `json:"processPath"`
+	SpecialProxy string  `json:"specialProxy"`
 }
 
 func (m *Metadata) RemoteAddress() string {
@@ -75,18 +82,41 @@ func (m *Metadata) SourceAddress() string {
 	return net.JoinHostPort(m.SrcIP.String(), m.SrcPort)
 }
 
+func (m *Metadata) AddrType() int {
+	switch true {
+	case m.Host != "" || m.DstIP == nil:
+		return socks5.AtypDomainName
+	case m.DstIP.To4() != nil:
+		return socks5.AtypIPv4
+	default:
+		return socks5.AtypIPv6
+	}
+}
+
 func (m *Metadata) Resolved() bool {
 	return m.DstIP != nil
+}
+
+// Pure is used to solve unexpected behavior
+// when dialing proxy connection in DNSMapping mode.
+func (m *Metadata) Pure() *Metadata {
+	if m.DNSMode == DNSMapping && m.DstIP != nil {
+		copy := *m
+		copy.Host = ""
+		return &copy
+	}
+
+	return m
 }
 
 func (m *Metadata) UDPAddr() *net.UDPAddr {
 	if m.NetWork != UDP || m.DstIP == nil {
 		return nil
 	}
-	port, _ := strconv.Atoi(m.DstPort)
+	port, _ := strconv.ParseUint(m.DstPort, 10, 16)
 	return &net.UDPAddr{
 		IP:   m.DstIP,
-		Port: port,
+		Port: int(port),
 	}
 }
 

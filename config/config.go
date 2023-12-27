@@ -8,29 +8,33 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Dreamacro/clash/adapters/outbound"
-	"github.com/Dreamacro/clash/adapters/outboundgroup"
-	"github.com/Dreamacro/clash/adapters/provider"
+	"github.com/Dreamacro/clash/adapter"
+	"github.com/Dreamacro/clash/adapter/outbound"
+	"github.com/Dreamacro/clash/adapter/outboundgroup"
+	"github.com/Dreamacro/clash/adapter/provider"
 	"github.com/Dreamacro/clash/component/auth"
 	"github.com/Dreamacro/clash/component/fakeip"
 	"github.com/Dreamacro/clash/component/trie"
 	C "github.com/Dreamacro/clash/constant"
+	providerTypes "github.com/Dreamacro/clash/constant/provider"
 	"github.com/Dreamacro/clash/dns"
 	"github.com/Dreamacro/clash/log"
-	R "github.com/Dreamacro/clash/rules"
+	R "github.com/Dreamacro/clash/rule"
 	T "github.com/Dreamacro/clash/tunnel"
 
-	yaml "gopkg.in/yaml.v2"
+	"github.com/samber/lo"
+	"gopkg.in/yaml.v3"
 )
 
 // General config
 type General struct {
 	Inbound
 	Controller
-	Mode      T.TunnelMode `json:"mode"`
-	LogLevel  log.LogLevel `json:"log-level"`
-	IPv6      bool         `json:"ipv6"`
-	Interface string       `json:"interface-name"`
+	Mode        T.TunnelMode `json:"mode"`
+	LogLevel    log.LogLevel `json:"log-level"`
+	IPv6        bool         `json:"ipv6"`
+	Interface   string       `json:"-"`
+	RoutingMark int          `json:"-"`
 }
 
 // Inbound
@@ -38,6 +42,7 @@ type Inbound struct {
 	Port           int      `json:"port"`
 	SocksPort      int      `json:"socks-port"`
 	RedirPort      int      `json:"redir-port"`
+	TProxyPort     int      `json:"tproxy-port"`
 	MixedPort      int      `json:"mixed-port"`
 	Authentication []string `json:"authentication"`
 	AllowLan       bool     `json:"allow-lan"`
@@ -59,20 +64,31 @@ type DNS struct {
 	Fallback          []dns.NameServer `yaml:"fallback"`
 	FallbackFilter    FallbackFilter   `yaml:"fallback-filter"`
 	Listen            string           `yaml:"listen"`
-	EnhancedMode      dns.EnhancedMode `yaml:"enhanced-mode"`
+	EnhancedMode      C.DNSMode        `yaml:"enhanced-mode"`
 	DefaultNameserver []dns.NameServer `yaml:"default-nameserver"`
 	FakeIPRange       *fakeip.Pool
 	Hosts             *trie.DomainTrie
+	NameServerPolicy  map[string]dns.NameServer
 }
 
 // FallbackFilter config
 type FallbackFilter struct {
-	GeoIP  bool         `yaml:"geoip"`
-	IPCIDR []*net.IPNet `yaml:"ipcidr"`
+	GeoIP     bool         `yaml:"geoip"`
+	GeoIPCode string       `yaml:"geoip-code"`
+	IPCIDR    []*net.IPNet `yaml:"ipcidr"`
+	Domain    []string     `yaml:"domain"`
+}
+
+// Profile config
+type Profile struct {
+	StoreSelected bool `yaml:"store-selected"`
+	StoreFakeIP   bool `yaml:"store-fake-ip"`
 }
 
 // Experimental config
-type Experimental struct{}
+type Experimental struct {
+	UDPFallbackMatch bool `yaml:"udp-fallback-match"`
+}
 
 // Config is clash config manager
 type Config struct {
@@ -80,10 +96,12 @@ type Config struct {
 	DNS          *DNS
 	Experimental *Experimental
 	Hosts        *trie.DomainTrie
+	Profile      *Profile
 	Rules        []C.Rule
 	Users        []auth.AuthUser
 	Proxies      map[string]C.Proxy
-	Providers    map[string]provider.ProxyProvider
+	Providers    map[string]providerTypes.ProxyProvider
+	Tunnels      []Tunnel
 }
 
 type RawDNS struct {
@@ -94,21 +112,83 @@ type RawDNS struct {
 	Fallback          []string          `yaml:"fallback"`
 	FallbackFilter    RawFallbackFilter `yaml:"fallback-filter"`
 	Listen            string            `yaml:"listen"`
-	EnhancedMode      dns.EnhancedMode  `yaml:"enhanced-mode"`
+	EnhancedMode      C.DNSMode         `yaml:"enhanced-mode"`
 	FakeIPRange       string            `yaml:"fake-ip-range"`
 	FakeIPFilter      []string          `yaml:"fake-ip-filter"`
 	DefaultNameserver []string          `yaml:"default-nameserver"`
+	NameServerPolicy  map[string]string `yaml:"nameserver-policy"`
 }
 
 type RawFallbackFilter struct {
-	GeoIP  bool     `yaml:"geoip"`
-	IPCIDR []string `yaml:"ipcidr"`
+	GeoIP     bool     `yaml:"geoip"`
+	GeoIPCode string   `yaml:"geoip-code"`
+	IPCIDR    []string `yaml:"ipcidr"`
+	Domain    []string `yaml:"domain"`
+}
+
+type tunnel struct {
+	Network []string `yaml:"network"`
+	Address string   `yaml:"address"`
+	Target  string   `yaml:"target"`
+	Proxy   string   `yaml:"proxy"`
+}
+
+type Tunnel tunnel
+
+// UnmarshalYAML implements yaml.Unmarshaler
+func (t *Tunnel) UnmarshalYAML(unmarshal func(any) error) error {
+	var tp string
+	if err := unmarshal(&tp); err != nil {
+		var inner tunnel
+		if err := unmarshal(&inner); err != nil {
+			return err
+		}
+
+		*t = Tunnel(inner)
+		return nil
+	}
+
+	// parse udp/tcp,address,target,proxy
+	parts := lo.Map(strings.Split(tp, ","), func(s string, _ int) string {
+		return strings.TrimSpace(s)
+	})
+	if len(parts) != 4 {
+		return fmt.Errorf("invalid tunnel config %s", tp)
+	}
+	network := strings.Split(parts[0], "/")
+
+	// validate network
+	for _, n := range network {
+		switch n {
+		case "tcp", "udp":
+		default:
+			return fmt.Errorf("invalid tunnel network %s", n)
+		}
+	}
+
+	// validate address and target
+	address := parts[1]
+	target := parts[2]
+	for _, addr := range []string{address, target} {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return fmt.Errorf("invalid tunnel target or address %s", addr)
+		}
+	}
+
+	*t = Tunnel(tunnel{
+		Network: network,
+		Address: address,
+		Target:  target,
+		Proxy:   parts[3],
+	})
+	return nil
 }
 
 type RawConfig struct {
 	Port               int          `yaml:"port"`
 	SocksPort          int          `yaml:"socks-port"`
 	RedirPort          int          `yaml:"redir-port"`
+	TProxyPort         int          `yaml:"tproxy-port"`
 	MixedPort          int          `yaml:"mixed-port"`
 	Authentication     []string     `yaml:"authentication"`
 	AllowLan           bool         `yaml:"allow-lan"`
@@ -120,14 +200,17 @@ type RawConfig struct {
 	ExternalUI         string       `yaml:"external-ui"`
 	Secret             string       `yaml:"secret"`
 	Interface          string       `yaml:"interface-name"`
+	RoutingMark        int          `yaml:"routing-mark"`
+	Tunnels            []Tunnel     `yaml:"tunnels"`
 
-	ProxyProvider map[string]map[string]interface{} `yaml:"proxy-providers"`
-	Hosts         map[string]string                 `yaml:"hosts"`
-	DNS           RawDNS                            `yaml:"dns"`
-	Experimental  Experimental                      `yaml:"experimental"`
-	Proxy         []map[string]interface{}          `yaml:"proxies"`
-	ProxyGroup    []map[string]interface{}          `yaml:"proxy-groups"`
-	Rule          []string                          `yaml:"rules"`
+	ProxyProvider map[string]map[string]any `yaml:"proxy-providers"`
+	Hosts         map[string]string         `yaml:"hosts"`
+	DNS           RawDNS                    `yaml:"dns"`
+	Experimental  Experimental              `yaml:"experimental"`
+	Profile       Profile                   `yaml:"profile"`
+	Proxy         []map[string]any          `yaml:"proxies"`
+	ProxyGroup    []map[string]any          `yaml:"proxy-groups"`
+	Rule          []string                  `yaml:"rules"`
 }
 
 // Parse config
@@ -141,7 +224,7 @@ func Parse(buf []byte) (*Config, error) {
 }
 
 func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
-	// config with some default value
+	// config with default value
 	rawCfg := &RawConfig{
 		AllowLan:       false,
 		BindAddress:    "*",
@@ -150,24 +233,28 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
 		LogLevel:       log.INFO,
 		Hosts:          map[string]string{},
 		Rule:           []string{},
-		Proxy:          []map[string]interface{}{},
-		ProxyGroup:     []map[string]interface{}{},
+		Proxy:          []map[string]any{},
+		ProxyGroup:     []map[string]any{},
 		DNS: RawDNS{
 			Enable:      false,
 			UseHosts:    true,
 			FakeIPRange: "198.18.0.1/16",
 			FallbackFilter: RawFallbackFilter{
-				GeoIP:  true,
-				IPCIDR: []string{},
+				GeoIP:     true,
+				GeoIPCode: "CN",
+				IPCIDR:    []string{},
 			},
 			DefaultNameserver: []string{
 				"114.114.114.114",
 				"8.8.8.8",
 			},
 		},
+		Profile: Profile{
+			StoreSelected: true,
+		},
 	}
 
-	if err := yaml.Unmarshal(buf, &rawCfg); err != nil {
+	if err := yaml.Unmarshal(buf, rawCfg); err != nil {
 		return nil, err
 	}
 
@@ -178,6 +265,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	config := &Config{}
 
 	config.Experimental = &rawCfg.Experimental
+	config.Profile = &rawCfg.Profile
 
 	general, err := parseGeneral(rawCfg)
 	if err != nil {
@@ -204,13 +292,21 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	}
 	config.Hosts = hosts
 
-	dnsCfg, err := parseDNS(rawCfg.DNS, hosts)
+	dnsCfg, err := parseDNS(rawCfg, hosts)
 	if err != nil {
 		return nil, err
 	}
 	config.DNS = dnsCfg
 
 	config.Users = parseAuthentication(rawCfg.Authentication)
+
+	config.Tunnels = rawCfg.Tunnels
+	// verify tunnels
+	for _, t := range config.Tunnels {
+		if _, ok := config.Proxies[t.Proxy]; !ok {
+			return nil, fmt.Errorf("tunnel proxy %s not found", t.Proxy)
+		}
+	}
 
 	return config, nil
 }
@@ -232,6 +328,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 			Port:        cfg.Port,
 			SocksPort:   cfg.SocksPort,
 			RedirPort:   cfg.RedirPort,
+			TProxyPort:  cfg.TProxyPort,
 			MixedPort:   cfg.MixedPort,
 			AllowLan:    cfg.AllowLan,
 			BindAddress: cfg.BindAddress,
@@ -241,34 +338,35 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 			ExternalUI:         cfg.ExternalUI,
 			Secret:             cfg.Secret,
 		},
-		Mode:      cfg.Mode,
-		LogLevel:  cfg.LogLevel,
-		IPv6:      cfg.IPv6,
-		Interface: cfg.Interface,
+		Mode:        cfg.Mode,
+		LogLevel:    cfg.LogLevel,
+		IPv6:        cfg.IPv6,
+		Interface:   cfg.Interface,
+		RoutingMark: cfg.RoutingMark,
 	}, nil
 }
 
-func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[string]provider.ProxyProvider, err error) {
+func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[string]providerTypes.ProxyProvider, err error) {
 	proxies = make(map[string]C.Proxy)
-	providersMap = make(map[string]provider.ProxyProvider)
+	providersMap = make(map[string]providerTypes.ProxyProvider)
 	proxyList := []string{}
 	proxiesConfig := cfg.Proxy
 	groupsConfig := cfg.ProxyGroup
 	providersConfig := cfg.ProxyProvider
 
-	proxies["DIRECT"] = outbound.NewProxy(outbound.NewDirect())
-	proxies["REJECT"] = outbound.NewProxy(outbound.NewReject())
+	proxies["DIRECT"] = adapter.NewProxy(outbound.NewDirect())
+	proxies["REJECT"] = adapter.NewProxy(outbound.NewReject())
 	proxyList = append(proxyList, "DIRECT", "REJECT")
 
 	// parse proxy
 	for idx, mapping := range proxiesConfig {
-		proxy, err := outbound.ParseProxy(mapping)
+		proxy, err := adapter.ParseProxy(mapping)
 		if err != nil {
-			return nil, nil, fmt.Errorf("Proxy %d: %w", idx, err)
+			return nil, nil, fmt.Errorf("proxy %d: %w", idx, err)
 		}
 
 		if _, exist := proxies[proxy.Name()]; exist {
-			return nil, nil, fmt.Errorf("Proxy %s is the duplicate name", proxy.Name())
+			return nil, nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name())
 		}
 		proxies[proxy.Name()] = proxy
 		proxyList = append(proxyList, proxy.Name())
@@ -278,7 +376,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	for idx, mapping := range groupsConfig {
 		groupName, existName := mapping["name"].(string)
 		if !existName {
-			return nil, nil, fmt.Errorf("ProxyGroup %d: missing name", idx)
+			return nil, nil, fmt.Errorf("proxy group %d: missing name", idx)
 		}
 		proxyList = append(proxyList, groupName)
 	}
@@ -313,20 +411,20 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	for idx, mapping := range groupsConfig {
 		group, err := outboundgroup.ParseProxyGroup(mapping, proxies, providersMap)
 		if err != nil {
-			return nil, nil, fmt.Errorf("ProxyGroup[%d]: %w", idx, err)
+			return nil, nil, fmt.Errorf("proxy group[%d]: %w", idx, err)
 		}
 
 		groupName := group.Name()
 		if _, exist := proxies[groupName]; exist {
-			return nil, nil, fmt.Errorf("ProxyGroup %s: the duplicate name", groupName)
+			return nil, nil, fmt.Errorf("proxy group %s: the duplicate name", groupName)
 		}
 
-		proxies[groupName] = outbound.NewProxy(group)
+		proxies[groupName] = adapter.NewProxy(group)
 	}
 
 	// initial compatible provider
 	for _, pd := range providersMap {
-		if pd.VehicleType() != provider.Compatible {
+		if pd.VehicleType() != providerTypes.Compatible {
 			continue
 		}
 
@@ -340,12 +438,17 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 	for _, v := range proxyList {
 		ps = append(ps, proxies[v])
 	}
-	hc := provider.NewHealthCheck(ps, "", 0)
+	hc := provider.NewHealthCheck(ps, "", 0, true)
 	pd, _ := provider.NewCompatibleProvider(provider.ReservedName, ps, hc)
 	providersMap[provider.ReservedName] = pd
 
-	global := outboundgroup.NewSelector("GLOBAL", []provider.ProxyProvider{pd})
-	proxies["GLOBAL"] = outbound.NewProxy(global)
+	global := outboundgroup.NewSelector(
+		&outboundgroup.GroupCommonOption{
+			Name: "GLOBAL",
+		},
+		[]providerTypes.ProxyProvider{pd},
+	)
+	proxies["GLOBAL"] = adapter.NewProxy(global)
 	return proxies, providersMap, nil
 }
 
@@ -373,11 +476,11 @@ func parseRules(cfg *RawConfig, proxies map[string]C.Proxy) ([]C.Rule, error) {
 			target = rule[2]
 			params = rule[3:]
 		default:
-			return nil, fmt.Errorf("Rules[%d] [%s] error: format invalid", idx, line)
+			return nil, fmt.Errorf("rules[%d] [%s] error: format invalid", idx, line)
 		}
 
 		if _, ok := proxies[target]; !ok {
-			return nil, fmt.Errorf("Rules[%d] [%s] error: proxy [%s] not found", idx, line, target)
+			return nil, fmt.Errorf("rules[%d] [%s] error: proxy [%s] not found", idx, line, target)
 		}
 
 		rule = trimArr(rule)
@@ -385,11 +488,7 @@ func parseRules(cfg *RawConfig, proxies map[string]C.Proxy) ([]C.Rule, error) {
 
 		parsed, parseErr := R.ParseRule(rule[0], payload, target, params)
 		if parseErr != nil {
-			if parseErr == R.ErrPlatformNotSupport {
-				log.Warnln("Rules[%d] [%s] don't support current OS, skip", idx, line)
-				continue
-			}
-			return nil, fmt.Errorf("Rules[%d] [%s] error: %s", idx, line, parseErr.Error())
+			return nil, fmt.Errorf("rules[%d] [%s] error: %s", idx, line, parseErr.Error())
 		}
 
 		rules = append(rules, parsed)
@@ -403,7 +502,7 @@ func parseHosts(cfg *RawConfig) (*trie.DomainTrie, error) {
 
 	// add default hosts
 	if err := tree.Insert("localhost", net.IP{127, 0, 0, 1}); err != nil {
-		println(err.Error())
+		log.Errorln("insert localhost to host error: %s", err.Error())
 	}
 
 	if len(cfg.Hosts) != 0 {
@@ -449,6 +548,10 @@ func parseNameServer(servers []string) ([]dns.NameServer, error) {
 			return nil, fmt.Errorf("DNS NameServer[%d] format error: %s", idx, err.Error())
 		}
 
+		// parse with specific interface
+		// .e.g 10.0.0.1#en0
+		interfaceName := u.Fragment
+
 		var addr, dnsNetType string
 		switch u.Scheme {
 		case "udp":
@@ -464,6 +567,9 @@ func parseNameServer(servers []string) ([]dns.NameServer, error) {
 			clearURL := url.URL{Scheme: "https", Host: u.Host, Path: u.Path}
 			addr = clearURL.String()
 			dnsNetType = "https" // DNS over HTTPS
+		case "dhcp":
+			addr = u.Host
+			dnsNetType = "dhcp" // UDP from DHCP
 		default:
 			return nil, fmt.Errorf("DNS NameServer[%d] unsupport scheme: %s", idx, u.Scheme)
 		}
@@ -475,12 +581,30 @@ func parseNameServer(servers []string) ([]dns.NameServer, error) {
 		nameservers = append(
 			nameservers,
 			dns.NameServer{
-				Net:  dnsNetType,
-				Addr: addr,
+				Net:       dnsNetType,
+				Addr:      addr,
+				Interface: interfaceName,
 			},
 		)
 	}
 	return nameservers, nil
+}
+
+func parseNameServerPolicy(nsPolicy map[string]string) (map[string]dns.NameServer, error) {
+	policy := map[string]dns.NameServer{}
+
+	for domain, server := range nsPolicy {
+		nameservers, err := parseNameServer([]string{server})
+		if err != nil {
+			return nil, err
+		}
+		if _, valid := trie.ValidAndSplitDomain(domain); !valid {
+			return nil, fmt.Errorf("DNS ResoverRule invalid domain: %s", domain)
+		}
+		policy[domain] = nameservers[0]
+	}
+
+	return policy, nil
 }
 
 func parseFallbackIPCIDR(ips []string) ([]*net.IPNet, error) {
@@ -497,9 +621,10 @@ func parseFallbackIPCIDR(ips []string) ([]*net.IPNet, error) {
 	return ipNets, nil
 }
 
-func parseDNS(cfg RawDNS, hosts *trie.DomainTrie) (*DNS, error) {
+func parseDNS(rawCfg *RawConfig, hosts *trie.DomainTrie) (*DNS, error) {
+	cfg := rawCfg.DNS
 	if cfg.Enable && len(cfg.NameServer) == 0 {
-		return nil, fmt.Errorf("If DNS configuration is turned on, NameServer cannot be empty")
+		return nil, fmt.Errorf("if DNS configuration is turned on, NameServer cannot be empty")
 	}
 
 	dnsCfg := &DNS{
@@ -520,6 +645,10 @@ func parseDNS(cfg RawDNS, hosts *trie.DomainTrie) (*DNS, error) {
 		return nil, err
 	}
 
+	if dnsCfg.NameServerPolicy, err = parseNameServerPolicy(cfg.NameServerPolicy); err != nil {
+		return nil, err
+	}
+
 	if len(cfg.DefaultNameserver) == 0 {
 		return nil, errors.New("default nameserver should have at least one nameserver")
 	}
@@ -534,7 +663,7 @@ func parseDNS(cfg RawDNS, hosts *trie.DomainTrie) (*DNS, error) {
 		}
 	}
 
-	if cfg.EnhancedMode == dns.FAKEIP {
+	if cfg.EnhancedMode == C.DNSFakeIP {
 		_, ipnet, err := net.ParseCIDR(cfg.FakeIPRange)
 		if err != nil {
 			return nil, err
@@ -549,7 +678,12 @@ func parseDNS(cfg RawDNS, hosts *trie.DomainTrie) (*DNS, error) {
 			}
 		}
 
-		pool, err := fakeip.New(ipnet, 1000, host)
+		pool, err := fakeip.New(fakeip.Options{
+			IPNet:       ipnet,
+			Size:        1000,
+			Host:        host,
+			Persistence: rawCfg.Profile.StoreFakeIP,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -558,9 +692,11 @@ func parseDNS(cfg RawDNS, hosts *trie.DomainTrie) (*DNS, error) {
 	}
 
 	dnsCfg.FallbackFilter.GeoIP = cfg.FallbackFilter.GeoIP
+	dnsCfg.FallbackFilter.GeoIPCode = cfg.FallbackFilter.GeoIPCode
 	if fallbackip, err := parseFallbackIPCIDR(cfg.FallbackFilter.IPCIDR); err == nil {
 		dnsCfg.FallbackFilter.IPCIDR = fallbackip
 	}
+	dnsCfg.FallbackFilter.Domain = cfg.FallbackFilter.Domain
 
 	if cfg.UseHosts {
 		dnsCfg.Hosts = hosts
@@ -570,11 +706,10 @@ func parseDNS(cfg RawDNS, hosts *trie.DomainTrie) (*DNS, error) {
 }
 
 func parseAuthentication(rawRecords []string) []auth.AuthUser {
-	users := make([]auth.AuthUser, 0)
+	users := []auth.AuthUser{}
 	for _, line := range rawRecords {
-		userData := strings.SplitN(line, ":", 2)
-		if len(userData) == 2 {
-			users = append(users, auth.AuthUser{User: userData[0], Pass: userData[1]})
+		if user, pass, found := strings.Cut(line, ":"); found {
+			users = append(users, auth.AuthUser{User: user, Pass: pass})
 		}
 	}
 	return users
